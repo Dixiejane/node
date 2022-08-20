@@ -29,7 +29,7 @@ class BigIntBuiltinsAssembler : public CodeStubAssembler {
 
   void WriteBigIntSignAndLength(TNode<BigInt> bigint, TNode<Uint32T> sign,
                                 TNode<IntPtrT> length) {
-    STATIC_ASSERT(BigIntBase::SignBits::kShift == 0);
+    static_assert(BigIntBase::SignBits::kShift == 0);
     TNode<Uint32T> bitfield = Unsigned(
         Word32Or(Word32Shl(TruncateIntPtrToInt32(length),
                            Int32Constant(BigIntBase::LengthBits::kShift)),
@@ -61,6 +61,20 @@ class BigIntBuiltinsAssembler : public CodeStubAssembler {
                   std::make_pair(MachineType::AnyTagged(), result),
                   std::make_pair(MachineType::AnyTagged(), x),
                   std::make_pair(MachineType::AnyTagged(), y));
+  }
+
+  TNode<BoolT> CppAbsoluteMulAndCanonicalize(TNode<BigInt> result,
+                                             TNode<BigInt> x, TNode<BigInt> y) {
+    TNode<ExternalReference> mutable_big_int_absolute_mul_and_canonicalize =
+        ExternalConstant(
+            ExternalReference::
+                mutable_big_int_absolute_mul_and_canonicalize_function());
+    TNode<BoolT> success = UncheckedCast<BoolT>(CallCFunction(
+        mutable_big_int_absolute_mul_and_canonicalize, MachineType::Bool(),
+        std::make_pair(MachineType::AnyTagged(), result),
+        std::make_pair(MachineType::AnyTagged(), x),
+        std::make_pair(MachineType::AnyTagged(), y)));
+    return success;
   }
 
   TNode<Int32T> CppAbsoluteCompare(TNode<BigInt> x, TNode<BigInt> y) {

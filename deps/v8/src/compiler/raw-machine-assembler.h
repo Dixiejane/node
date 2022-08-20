@@ -8,7 +8,6 @@
 #include <initializer_list>
 #include <type_traits>
 
-#include "src/codegen/assembler.h"
 #include "src/common/globals.h"
 #include "src/compiler/access-builder.h"
 #include "src/compiler/common-operator.h"
@@ -334,6 +333,10 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
       return AddNode(machine()->Word32AtomicPairCompareExchange(), base, index,
                      old_value, old_value_high, new_value, new_value_high);
     }
+  }
+
+  Node* MemoryBarrier(AtomicMemoryOrder order) {
+    return AddNode(machine()->MemoryBarrier(order));
   }
 
   // Arithmetic Operations.
@@ -803,6 +806,12 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
   }
   Node* TryTruncateFloat64ToUint64(Node* a) {
     return AddNode(machine()->TryTruncateFloat64ToUint64(), a);
+  }
+  Node* TryTruncateFloat64ToInt32(Node* a) {
+    return AddNode(machine()->TryTruncateFloat64ToInt32(), a);
+  }
+  Node* TryTruncateFloat64ToUint32(Node* a) {
+    return AddNode(machine()->TryTruncateFloat64ToUint32(), a);
   }
   Node* ChangeInt32ToInt64(Node* a) {
     return AddNode(machine()->ChangeInt32ToInt64(), a);

@@ -16,12 +16,12 @@ namespace internal {
 
 void LocalEmbedderHeapTracer::SetRemoteTracer(EmbedderHeapTracer* tracer) {
   CHECK_NULL(cpp_heap_);
-  if (remote_tracer_) remote_tracer_->isolate_ = nullptr;
+  if (remote_tracer_) remote_tracer_->v8_isolate_ = nullptr;
 
   remote_tracer_ = tracer;
   default_embedder_roots_handler_.SetTracer(tracer);
   if (remote_tracer_)
-    remote_tracer_->isolate_ = reinterpret_cast<v8::Isolate*>(isolate_);
+    remote_tracer_->v8_isolate_ = reinterpret_cast<v8::Isolate*>(isolate_);
 }
 
 void LocalEmbedderHeapTracer::SetCppHeap(CppHeap* cpp_heap) {
@@ -173,16 +173,6 @@ void LocalEmbedderHeapTracer::StartIncrementalMarkingIfNeeded() {
     heap->FinalizeIncrementalMarkingAtomically(
         i::GarbageCollectionReason::kExternalFinalize);
   }
-}
-
-void LocalEmbedderHeapTracer::NotifyEmptyEmbedderStack() {
-  auto* overriden_stack_state = isolate_->heap()->overriden_stack_state();
-  if (overriden_stack_state &&
-      (*overriden_stack_state ==
-       cppgc::EmbedderStackState::kMayContainHeapPointers))
-    return;
-
-  isolate_->global_handles()->NotifyEmptyEmbedderStack();
 }
 
 void LocalEmbedderHeapTracer::EmbedderWriteBarrier(Heap* heap,

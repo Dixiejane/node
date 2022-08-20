@@ -47,8 +47,6 @@ void IncrementalMarking::Observer::Step(int bytes_allocated, Address addr,
   RCS_SCOPE(heap->isolate(),
             RuntimeCallCounterId::kGC_Custom_IncrementalMarkingObserver);
   incremental_marking_->AdvanceOnAllocation();
-  // AdvanceIncrementalMarkingOnAllocation can start incremental marking.
-  incremental_marking_->EnsureBlackAllocated(addr, size);
 }
 
 IncrementalMarking::IncrementalMarking(Heap* heap, WeakObjects* weak_objects)
@@ -59,9 +57,7 @@ IncrementalMarking::IncrementalMarking(Heap* heap, WeakObjects* weak_objects)
       old_generation_observer_(this, kOldGenerationAllocatedThreshold),
       marking_state_(heap->isolate()),
       atomic_marking_state_(heap->isolate()),
-      non_atomic_marking_state_(heap->isolate()) {
-  SetState(STOPPED);
-}
+      non_atomic_marking_state_(heap->isolate()) {}
 
 void IncrementalMarking::MarkBlackAndVisitObjectDueToLayoutChange(
     HeapObject obj) {
@@ -79,14 +75,16 @@ void IncrementalMarking::MarkBlackBackground(HeapObject obj, int object_size) {
 }
 
 void IncrementalMarking::NotifyLeftTrimming(HeapObject from, HeapObject to) {
-  DCHECK(IsMarking());
+  if (!IsMarking()) return;
+
   DCHECK(MemoryChunk::FromHeapObject(from)->SweepingDone());
   DCHECK_EQ(MemoryChunk::FromHeapObject(from), MemoryChunk::FromHeapObject(to));
   DCHECK_NE(from, to);
 
   MarkBit new_mark_bit = marking_state()->MarkBitFrom(to);
 
-  if (black_allocation() && Marking::IsBlack<kAtomicity>(new_mark_bit)) {
+  if (black_allocation() &&
+      Marking::IsBlack<AccessMode::ATOMIC>(new_mark_bit)) {
     // Nothing to do if the object is in black area.
     return;
   }
@@ -96,19 +94,17 @@ void IncrementalMarking::NotifyLeftTrimming(HeapObject from, HeapObject to) {
   if (from.address() + kTaggedSize == to.address()) {
     // The old and the new markbits overlap. The |to| object has the
     // grey color. To make it black, we need to set the second bit.
-    DCHECK(new_mark_bit.Get<kAtomicity>());
-    new_mark_bit.Next().Set<kAtomicity>();
+    DCHECK(new_mark_bit.Get<AccessMode::ATOMIC>());
+    new_mark_bit.Next().Set<AccessMode::ATOMIC>();
   } else {
-    bool success = Marking::WhiteToBlack<kAtomicity>(new_mark_bit);
+    bool success = Marking::WhiteToBlack<AccessMode::ATOMIC>(new_mark_bit);
     DCHECK(success);
     USE(success);
   }
   DCHECK(marking_state()->IsBlack(to));
 }
 
-bool IncrementalMarking::WasActivated() { return was_activated_; }
-
-bool IncrementalMarking::CanBeActivated() {
+bool IncrementalMarking::CanBeStarted() const {
   // Only start incremental marking in a safe state:
   //   1) when incremental marking is turned on
   //   2) when we are currently not in a GC, and
@@ -148,8 +144,8 @@ void IncrementalMarking::Start(GarbageCollectionReason gc_reason) {
                                          : global_limit_mb - global_size_mb);
   }
   DCHECK(FLAG_incremental_marking);
-  DCHECK(state_ == STOPPED);
-  DCHECK(heap_->gc_state() == Heap::NOT_IN_GC);
+  DCHECK(IsStopped());
+  DCHECK_EQ(heap_->gc_state(), Heap::NOT_IN_GC);
   DCHECK(!heap_->isolate()->serializer_enabled());
 
   Counters* counters = heap_->isolate()->counters();
@@ -166,14 +162,14 @@ void IncrementalMarking::Start(GarbageCollectionReason gc_reason) {
   heap_->tracer()->NotifyIncrementalMarkingStart();
 
   start_time_ms_ = heap()->MonotonicallyIncreasingTimeInMs();
-  time_to_force_completion_ = 0.0;
+  completion_task_scheduled_ = false;
+  completion_task_timeout_ = 0.0;
   initial_old_generation_size_ = heap_->OldGenerationSizeOfObjects();
   old_generation_allocation_counter_ = heap_->OldGenerationAllocationCounter();
   bytes_marked_ = 0;
   scheduled_bytes_to_mark_ = 0;
   schedule_update_time_ms_ = start_time_ms_;
   bytes_marked_concurrently_ = 0;
-  was_activated_ = true;
 
   StartMarking();
 
@@ -182,7 +178,16 @@ void IncrementalMarking::Start(GarbageCollectionReason gc_reason) {
   incremental_marking_job()->Start(heap_);
 }
 
-class IncrementalMarkingRootMarkingVisitor final : public RootVisitor {
+bool IncrementalMarking::WhiteToGreyAndPush(HeapObject obj) {
+  if (marking_state()->WhiteToGrey(obj)) {
+    local_marking_worklists()->Push(obj);
+    return true;
+  }
+  return false;
+}
+
+class IncrementalMarking::IncrementalMarkingRootMarkingVisitor final
+    : public RootVisitor {
  public:
   explicit IncrementalMarkingRootMarkingVisitor(Heap* heap)
       : heap_(heap), incremental_marking_(heap->incremental_marking()) {}
@@ -221,19 +226,18 @@ class IncrementalMarkingRootMarkingVisitor final : public RootVisitor {
   IncrementalMarking* const incremental_marking_;
 };
 
-namespace {
-
-void MarkRoots(Heap* heap) {
-  IncrementalMarkingRootMarkingVisitor visitor(heap);
-  heap->IterateRoots(
+void IncrementalMarking::MarkRoots() {
+  IncrementalMarkingRootMarkingVisitor visitor(heap_);
+  CodePageHeaderModificationScope rwx_write_scope(
+      "Marking of builtins table entries require write access to Code page "
+      "header");
+  heap_->IterateRoots(
       &visitor,
       base::EnumSet<SkipRoot>{SkipRoot::kStack, SkipRoot::kMainThreadHandles,
                               SkipRoot::kWeak});
 }
 
-}  // namespace
-
-void IncrementalMarking::MarkRootsForTesting() { MarkRoots(heap_); }
+void IncrementalMarking::MarkRootsForTesting() { MarkRoots(); }
 
 void IncrementalMarking::StartMarking() {
   if (heap_->isolate()->serializer_enabled()) {
@@ -256,6 +260,10 @@ void IncrementalMarking::StartMarking() {
   is_compacting_ = collector_->StartCompaction(
       MarkCompactCollector::StartCompactionMode::kIncremental);
 
+#ifdef V8_COMPRESS_POINTERS
+  heap_->isolate()->external_pointer_table().StartCompactingIfNeeded();
+#endif  // V8_COMPRESS_POINTERS
+
   auto embedder_flags = heap_->flags_for_embedder_tracer();
   {
     TRACE_GC(heap()->tracer(),
@@ -267,7 +275,8 @@ void IncrementalMarking::StartMarking() {
 
   collector_->StartMarking();
 
-  SetState(MARKING);
+  is_marking_ = true;
+  heap_->SetIsMarkingFlag(true);
 
   MarkingBarrier::ActivateAll(heap(), is_compacting_);
   GlobalHandles::EnableMarkingBarrier(heap()->isolate());
@@ -276,7 +285,10 @@ void IncrementalMarking::StartMarking() {
 
   StartBlackAllocation();
 
-  MarkRoots(heap_);
+  {
+    TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_MARK_ROOTS);
+    MarkRoots();
+  }
 
   if (FLAG_concurrent_marking && !heap_->IsTearingDown()) {
     heap_->concurrent_marking()->ScheduleJob();
@@ -304,7 +316,11 @@ void IncrementalMarking::StartBlackAllocation() {
   black_allocation_ = true;
   heap()->old_space()->MarkLinearAllocationAreaBlack();
   if (heap()->map_space()) heap()->map_space()->MarkLinearAllocationAreaBlack();
-  heap()->code_space()->MarkLinearAllocationAreaBlack();
+  {
+    CodePageHeaderModificationScope rwx_write_scope(
+        "Marking Code objects requires write access to the Code page header");
+    heap()->code_space()->MarkLinearAllocationAreaBlack();
+  }
   heap()->safepoint()->IterateLocalHeaps([](LocalHeap* local_heap) {
     local_heap->MarkLinearAllocationAreaBlack();
   });
@@ -318,7 +334,11 @@ void IncrementalMarking::PauseBlackAllocation() {
   DCHECK(IsMarking());
   heap()->old_space()->UnmarkLinearAllocationArea();
   if (heap()->map_space()) heap()->map_space()->UnmarkLinearAllocationArea();
-  heap()->code_space()->UnmarkLinearAllocationArea();
+  {
+    CodePageHeaderModificationScope rwx_write_scope(
+        "Marking Code objects requires write access to the Code page header");
+    heap()->code_space()->UnmarkLinearAllocationArea();
+  }
   heap()->safepoint()->IterateLocalHeaps(
       [](LocalHeap* local_heap) { local_heap->UnmarkLinearAllocationArea(); });
   if (FLAG_trace_incremental_marking) {
@@ -338,110 +358,12 @@ void IncrementalMarking::FinishBlackAllocation() {
   }
 }
 
-void IncrementalMarking::EnsureBlackAllocated(Address allocated, size_t size) {
-  if (black_allocation() && allocated != kNullAddress) {
-    HeapObject object = HeapObject::FromAddress(allocated);
-    if (marking_state()->IsWhite(object) && !Heap::InYoungGeneration(object)) {
-      if (heap_->IsLargeObject(object)) {
-        marking_state()->WhiteToBlack(object);
-      } else {
-        Page::FromAddress(allocated)->CreateBlackArea(allocated,
-                                                      allocated + size);
-      }
-    }
-  }
-}
-
-bool IncrementalMarking::ShouldRetainMap(Map map, int age) {
-  if (age == 0) {
-    // The map has aged. Do not retain this map.
-    return false;
-  }
-  Object constructor = map.GetConstructor();
-  if (!constructor.IsHeapObject() ||
-      marking_state()->IsWhite(HeapObject::cast(constructor))) {
-    // The constructor is dead, no new objects with this map can
-    // be created. Do not retain this map.
-    return false;
-  }
-  return true;
-}
-
-void IncrementalMarking::RetainMaps() {
-  // Do not retain dead maps if flag disables it or there is
-  // - memory pressure (reduce_memory_footprint_),
-  // - GC is requested by tests or dev-tools (abort_incremental_marking_).
-  bool map_retaining_is_disabled = heap()->ShouldReduceMemory() ||
-                                   FLAG_retain_maps_for_n_gc == 0;
-  std::vector<WeakArrayList> retained_maps_list = heap()->FindAllRetainedMaps();
-
-  for (WeakArrayList retained_maps : retained_maps_list) {
-    int length = retained_maps.length();
-
-    for (int i = 0; i < length; i += 2) {
-      MaybeObject value = retained_maps.Get(i);
-      HeapObject map_heap_object;
-      if (!value->GetHeapObjectIfWeak(&map_heap_object)) {
-        continue;
-      }
-      int age = retained_maps.Get(i + 1).ToSmi().value();
-      int new_age;
-      Map map = Map::cast(map_heap_object);
-      if (!map_retaining_is_disabled && marking_state()->IsWhite(map)) {
-        if (ShouldRetainMap(map, age)) {
-          WhiteToGreyAndPush(map);
-          if (V8_UNLIKELY(FLAG_track_retaining_path)) {
-            heap_->AddRetainingRoot(Root::kRetainMaps, map);
-          }
-        }
-        Object prototype = map.prototype();
-        if (age > 0 && prototype.IsHeapObject() &&
-            marking_state()->IsWhite(HeapObject::cast(prototype))) {
-          // The prototype is not marked, age the map.
-          new_age = age - 1;
-        } else {
-          // The prototype and the constructor are marked, this map keeps only
-          // transition tree alive, not JSObjects. Do not age the map.
-          new_age = age;
-        }
-      } else {
-        new_age = FLAG_retain_maps_for_n_gc;
-      }
-      // Compact the array and update the age.
-      if (new_age != age) {
-        retained_maps.Set(i + 1, MaybeObject::FromSmi(Smi::FromInt(new_age)));
-      }
-    }
-  }
-}
-
-void IncrementalMarking::FinalizeIncrementally() {
-  TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_INCREMENTAL_FINALIZE_BODY);
-  DCHECK(!finalize_marking_completed_);
-  DCHECK(IsMarking());
-
-  double start = heap_->MonotonicallyIncreasingTimeInMs();
-
-  // Map retaining is needed for performance, not correctness,
-  // so we can do it only once at the beginning of the finalization.
-  RetainMaps();
-
-  finalize_marking_completed_ = true;
-
-  if (FLAG_trace_incremental_marking) {
-    double end = heap_->MonotonicallyIncreasingTimeInMs();
-    double delta = end - start;
-    heap()->isolate()->PrintWithTimestamp(
-        "[IncrementalMarking] Finalize incrementally spent %.1f ms.\n", delta);
-  }
-}
-
 void IncrementalMarking::UpdateMarkingWorklistAfterYoungGenGC() {
   if (!IsMarking()) return;
 
   Map filler_map = ReadOnlyRoots(heap_).one_pointer_filler_map();
 
-  MinorMarkCompactCollector::MarkingState* minor_marking_state =
+  MarkingState* minor_marking_state =
       heap()->minor_mark_compact_collector()->marking_state();
 
   collector_->local_marking_worklists()->Publish();
@@ -459,9 +381,8 @@ void IncrementalMarking::UpdateMarkingWorklistAfterYoungGenGC() {
     DCHECK(obj.IsHeapObject());
     // Only pointers to from space have to be updated.
     if (Heap::InFromPage(obj)) {
-      DCHECK_IMPLIES(FLAG_minor_mc_sweeping, minor_marking_state->IsWhite(obj));
+      DCHECK(!FLAG_minor_mc);
       MapWord map_word = obj.map_word(cage_base, kRelaxedLoad);
-      DCHECK_IMPLIES(FLAG_minor_mc_sweeping, !map_word.IsForwardingAddress());
       if (!map_word.IsForwardingAddress()) {
         // There may be objects on the marking deque that do not exist
         // anymore, e.g. left trimmed objects or objects from the root set
@@ -484,6 +405,11 @@ void IncrementalMarking::UpdateMarkingWorklistAfterYoungGenGC() {
       // new space.
       DCHECK(Heap::IsLargeObject(obj) || Page::FromHeapObject(obj)->IsFlagSet(
                                              Page::PAGE_NEW_NEW_PROMOTION));
+      DCHECK_IMPLIES(FLAG_minor_mc, !Page::FromHeapObject(obj)->IsFlagSet(
+                                        Page::PAGE_NEW_NEW_PROMOTION));
+      DCHECK_IMPLIES(
+          FLAG_minor_mc,
+          !obj.map_word(cage_base, kRelaxedLoad).IsForwardingAddress());
       if (minor_marking_state->IsWhite(obj)) {
         return false;
       }
@@ -522,12 +448,6 @@ void IncrementalMarking::UpdateMarkedBytesAfterScavenge(
     size_t dead_bytes_in_new_space) {
   if (!IsMarking()) return;
   bytes_marked_ -= std::min(bytes_marked_, dead_bytes_in_new_space);
-}
-
-void IncrementalMarking::ProcessBlackAllocatedObject(HeapObject obj) {
-  if (IsMarking() && marking_state()->IsBlack(obj)) {
-    collector_->RevisitObject(obj);
-  }
 }
 
 StepResult IncrementalMarking::EmbedderStep(double expected_duration_ms,
@@ -599,8 +519,11 @@ bool IncrementalMarking::Stop() {
     }
   }
 
+  collection_requested_via_stack_guard_ = false;
   heap_->isolate()->stack_guard()->ClearGC();
-  SetState(STOPPED);
+
+  is_marking_ = false;
+  heap_->SetIsMarkingFlag(false);
   is_compacting_ = false;
   FinishBlackAllocation();
 
@@ -617,19 +540,6 @@ bool IncrementalMarking::Stop() {
   return true;
 }
 
-void IncrementalMarking::FinalizeMarking(CompletionAction action) {
-  DCHECK(!finalize_marking_completed_);
-  if (FLAG_trace_incremental_marking) {
-    heap()->isolate()->PrintWithTimestamp(
-        "[IncrementalMarking] requesting finalization of incremental "
-        "marking.\n");
-  }
-  request_type_ = GCRequestType::FINALIZATION;
-  if (action == GC_VIA_STACK_GUARD) {
-    heap_->isolate()->stack_guard()->RequestGC();
-  }
-}
-
 double IncrementalMarking::CurrentTimeToMarkingTask() const {
   const double recorded_time_to_marking_task =
       heap_->tracer()->AverageTimeToIncrementalMarkingTask();
@@ -639,74 +549,70 @@ double IncrementalMarking::CurrentTimeToMarkingTask() const {
   return std::max(recorded_time_to_marking_task, current_time_to_marking_task);
 }
 
-void IncrementalMarking::MarkingComplete(CompletionAction action) {
-  // Allowed overshoot percantage of incremental marking walltime.
-  constexpr double kAllowedOvershoot = 0.1;
-  // Minimum overshoot in ms. This is used to allow moving away from stack when
-  // marking was fast.
-  constexpr double kMinOvershootMs = 50;
+bool IncrementalMarking::ShouldWaitForTask() {
+  if (!completion_task_scheduled_) {
+    incremental_marking_job_.ScheduleTask(
+        heap(), IncrementalMarkingJob::TaskType::kNormal);
+    completion_task_scheduled_ = true;
+  }
 
-  if (action == GC_VIA_STACK_GUARD) {
-    if (time_to_force_completion_ == 0.0) {
-      const double now = heap_->MonotonicallyIncreasingTimeInMs();
-      const double overshoot_ms =
-          std::max(kMinOvershootMs, (now - start_time_ms_) * kAllowedOvershoot);
-      const double time_to_marking_task = CurrentTimeToMarkingTask();
-      if (time_to_marking_task == 0.0 || time_to_marking_task > overshoot_ms) {
-        if (FLAG_trace_incremental_marking) {
-          heap()->isolate()->PrintWithTimestamp(
-              "[IncrementalMarking] Not delaying marking completion. time to "
-              "task: %fms allowed overshoot: %fms\n",
-              time_to_marking_task, overshoot_ms);
-        }
-      } else {
-        time_to_force_completion_ = now + overshoot_ms;
-        if (FLAG_trace_incremental_marking) {
-          heap()->isolate()->PrintWithTimestamp(
-              "[IncrementalMarking] Delaying GC via stack guard. time to task: "
-              "%fms "
-              "allowed overshoot: %fms\n",
-              time_to_marking_task, overshoot_ms);
-        }
-        incremental_marking_job_.ScheduleTask(
-            heap(), IncrementalMarkingJob::TaskType::kNormal);
-        return;
-      }
-    }
-    if (heap()->MonotonicallyIncreasingTimeInMs() < time_to_force_completion_) {
-      if (FLAG_trace_incremental_marking) {
-        heap()->isolate()->PrintWithTimestamp(
-            "[IncrementalMarking] Delaying GC via stack guard. time left: "
-            "%fms\n",
-            time_to_force_completion_ -
-                heap_->MonotonicallyIncreasingTimeInMs());
-      }
-      return;
+  if (completion_task_timeout_ == 0.0) {
+    if (!TryInitializeTaskTimeout()) {
+      return false;
     }
   }
 
-  SetState(COMPLETE);
-  // We will set the stack guard to request a GC now.  This will mean the rest
-  // of the GC gets performed as soon as possible (we can't do a GC here in a
-  // record-write context).  If a few things get allocated between now and then
-  // that shouldn't make us do a scavenge and keep being incremental.
-  if (FLAG_trace_incremental_marking) {
+  const double current_time = heap()->MonotonicallyIncreasingTimeInMs();
+  const bool wait_for_task = current_time < completion_task_timeout_;
+
+  if (FLAG_trace_incremental_marking && wait_for_task) {
     heap()->isolate()->PrintWithTimestamp(
-        "[IncrementalMarking] Complete (normal).\n");
+        "[IncrementalMarking] Delaying GC via stack guard. time left: "
+        "%fms\n",
+        completion_task_timeout_ - current_time);
   }
-  request_type_ = GCRequestType::COMPLETE_MARKING;
-  if (action == GC_VIA_STACK_GUARD) {
-    heap_->isolate()->stack_guard()->RequestGC();
-  }
+
+  return wait_for_task;
 }
 
-void IncrementalMarking::Epilogue() {
-  was_activated_ = false;
-  finalize_marking_completed_ = false;
+bool IncrementalMarking::TryInitializeTaskTimeout() {
+  // Allowed overshoot percentage of incremental marking walltime.
+  constexpr double kAllowedOvershoot = 0.1;
+  // Minimum overshoot in ms. This is used to allow moving away from stack
+  // when marking was fast.
+  constexpr double kMinOvershootMs = 50;
+
+  const double now = heap_->MonotonicallyIncreasingTimeInMs();
+  const double overshoot_ms =
+      std::max(kMinOvershootMs, (now - start_time_ms_) * kAllowedOvershoot);
+  const double time_to_marking_task = CurrentTimeToMarkingTask();
+
+  if (time_to_marking_task == 0.0 || time_to_marking_task > overshoot_ms) {
+    if (FLAG_trace_incremental_marking) {
+      heap()->isolate()->PrintWithTimestamp(
+          "[IncrementalMarking] Not delaying marking completion. time to "
+          "task: %fms allowed overshoot: %fms\n",
+          time_to_marking_task, overshoot_ms);
+    }
+
+    return false;
+  } else {
+    completion_task_timeout_ = now + overshoot_ms;
+
+    if (FLAG_trace_incremental_marking) {
+      heap()->isolate()->PrintWithTimestamp(
+          "[IncrementalMarking] Delaying GC via stack guard. time to task: "
+          "%fms "
+          "allowed overshoot: %fms\n",
+          time_to_marking_task, overshoot_ms);
+    }
+
+    return true;
+  }
 }
 
 bool IncrementalMarking::ShouldDoEmbedderStep() {
-  return state_ == MARKING && FLAG_incremental_marking_wrappers &&
+  return IsRunning() && FLAG_incremental_marking_wrappers &&
          heap_->local_embedder_heap_tracer()->InUse();
 }
 
@@ -749,31 +655,71 @@ void IncrementalMarking::ScheduleBytesToMarkBasedOnTime(double time_ms) {
   }
 }
 
-namespace {
-StepResult CombineStepResults(StepResult a, StepResult b) {
-  DCHECK_NE(StepResult::kWaitingForFinalization, a);
-  DCHECK_NE(StepResult::kWaitingForFinalization, b);
-  if (a == StepResult::kMoreWorkRemaining ||
-      b == StepResult::kMoreWorkRemaining)
-    return StepResult::kMoreWorkRemaining;
-  return StepResult::kNoImmediateWork;
+void IncrementalMarking::AdvanceFromTask() {
+  AdvanceWithDeadline(StepOrigin::kTask);
+  heap()->FinalizeIncrementalMarkingIfComplete(
+      GarbageCollectionReason::kFinalizeMarkingViaTask);
 }
-}  // anonymous namespace
 
-StepResult IncrementalMarking::AdvanceWithDeadline(
-    double deadline_in_ms, CompletionAction completion_action,
-    StepOrigin step_origin) {
+void IncrementalMarking::AdvanceForTesting(double max_step_size_in_ms) {
+  Step(max_step_size_in_ms, StepOrigin::kV8);
+}
+
+void IncrementalMarking::AdvanceOnAllocation() {
+  DCHECK_EQ(heap_->gc_state(), Heap::NOT_IN_GC);
+  DCHECK(FLAG_incremental_marking);
+  DCHECK(IsRunning());
+
+  // Code using an AlwaysAllocateScope assumes that the GC state does not
+  // change; that implies that no marking steps must be performed.
+  if (heap_->always_allocate()) {
+    return;
+  }
+
+  NestedTimedHistogramScope incremental_marking_scope(
+      heap_->isolate()->counters()->gc_incremental_marking());
+  TRACE_EVENT0("v8", "V8.GCIncrementalMarking");
+  TRACE_GC_EPOCH(heap_->tracer(), GCTracer::Scope::MC_INCREMENTAL,
+                 ThreadKind::kMain);
+  ScheduleBytesToMarkBasedOnAllocation();
+  Step(kMaxStepSizeInMs, StepOrigin::kV8);
+
+  if (IsComplete()) {
+    // Marking cannot be finalized here. Schedule a completion task instead.
+
+    if (!ShouldWaitForTask()) {
+      // When task isn't run soon enough, fall back to stack guard to force
+      // completion.
+      collection_requested_via_stack_guard_ = true;
+      heap_->isolate()->stack_guard()->RequestGC();
+    }
+  }
+}
+
+void IncrementalMarking::AdvanceWithDeadline(StepOrigin step_origin) {
   NestedTimedHistogramScope incremental_marking_scope(
       heap_->isolate()->counters()->gc_incremental_marking());
   TRACE_EVENT1("v8", "V8.GCIncrementalMarking", "epoch",
                heap_->tracer()->CurrentEpoch(GCTracer::Scope::MC_INCREMENTAL));
   TRACE_GC_EPOCH(heap_->tracer(), GCTracer::Scope::MC_INCREMENTAL,
                  ThreadKind::kMain);
-  DCHECK(!IsStopped());
+  DCHECK(IsRunning());
 
   ScheduleBytesToMarkBasedOnTime(heap()->MonotonicallyIncreasingTimeInMs());
   FastForwardScheduleIfCloseToFinalization();
-  return Step(kStepSizeInMs, completion_action, step_origin);
+  Step(kStepSizeInMs, step_origin);
+}
+
+bool IncrementalMarking::ShouldFinalize() const {
+  DCHECK(IsRunning());
+
+  return heap()
+             ->mark_compact_collector()
+             ->local_marking_worklists()
+             ->IsEmpty() &&
+         heap()
+             ->local_embedder_heap_tracer()
+             ->ShouldFinalizeIncrementalMarking();
 }
 
 size_t IncrementalMarking::StepSizeToKeepUpWithAllocations() {
@@ -826,7 +772,7 @@ void IncrementalMarking::FetchBytesMarkedConcurrently() {
   if (FLAG_concurrent_marking) {
     size_t current_bytes_marked_concurrently =
         heap()->concurrent_marking()->TotalMarkedBytes();
-    // The concurrent_marking()->TotalMarkedBytes() is not monothonic for a
+    // The concurrent_marking()->TotalMarkedBytes() is not monotonic for a
     // short period of time when a concurrent marking task is finishing.
     if (current_bytes_marked_concurrently > bytes_marked_concurrently_) {
       bytes_marked_ +=
@@ -854,7 +800,7 @@ size_t IncrementalMarking::ComputeStepSizeInBytes(StepOrigin step_origin) {
           (bytes_marked_ - scheduled_bytes_to_mark_) / KB);
     }
   }
-  // Allow steps on allocation to get behind the schedule by small ammount.
+  // Allow steps on allocation to get behind the schedule by small amount.
   // This gives higher priority to steps in tasks.
   size_t kScheduleMarginInBytes = step_origin == StepOrigin::kV8 ? 1 * MB : 0;
   if (bytes_marked_ + kScheduleMarginInBytes > scheduled_bytes_to_mark_)
@@ -862,118 +808,92 @@ size_t IncrementalMarking::ComputeStepSizeInBytes(StepOrigin step_origin) {
   return scheduled_bytes_to_mark_ - bytes_marked_ - kScheduleMarginInBytes;
 }
 
-void IncrementalMarking::AdvanceOnAllocation() {
-  // Code using an AlwaysAllocateScope assumes that the GC state does not
-  // change; that implies that no marking steps must be performed.
-  if (heap_->gc_state() != Heap::NOT_IN_GC || !FLAG_incremental_marking ||
-      state_ != MARKING || heap_->always_allocate()) {
-    return;
-  }
-  NestedTimedHistogramScope incremental_marking_scope(
-      heap_->isolate()->counters()->gc_incremental_marking());
-  TRACE_EVENT0("v8", "V8.GCIncrementalMarking");
-  TRACE_GC_EPOCH(heap_->tracer(), GCTracer::Scope::MC_INCREMENTAL,
-                 ThreadKind::kMain);
-  ScheduleBytesToMarkBasedOnAllocation();
-  Step(kMaxStepSizeInMs, GC_VIA_STACK_GUARD, StepOrigin::kV8);
-}
-
-StepResult IncrementalMarking::Step(double max_step_size_in_ms,
-                                    CompletionAction action,
-                                    StepOrigin step_origin) {
+void IncrementalMarking::Step(double max_step_size_in_ms,
+                              StepOrigin step_origin) {
+  DCHECK(IsRunning());
   double start = heap_->MonotonicallyIncreasingTimeInMs();
 
-  StepResult combined_result = StepResult::kMoreWorkRemaining;
   size_t bytes_to_process = 0;
   size_t v8_bytes_processed = 0;
   double embedder_duration = 0.0;
   double embedder_deadline = 0.0;
-  if (state_ == MARKING) {
-    if (FLAG_concurrent_marking) {
-      // It is safe to merge back all objects that were on hold to the shared
-      // work list at Step because we are at a safepoint where all objects
-      // are properly initialized.
-      local_marking_worklists()->MergeOnHold();
-    }
+
+  if (FLAG_concurrent_marking) {
+    // It is safe to merge back all objects that were on hold to the shared
+    // work list at Step because we are at a safepoint where all objects
+    // are properly initialized.
+    local_marking_worklists()->MergeOnHold();
+  }
 
 // Only print marking worklist in debug mode to save ~40KB of code size.
 #ifdef DEBUG
-    if (FLAG_trace_incremental_marking && FLAG_trace_concurrent_marking &&
-        FLAG_trace_gc_verbose) {
-      collector_->marking_worklists()->Print();
-    }
+  if (FLAG_trace_incremental_marking && FLAG_trace_concurrent_marking &&
+      FLAG_trace_gc_verbose) {
+    collector_->marking_worklists()->Print();
+  }
 #endif
-    if (FLAG_trace_incremental_marking) {
-      heap_->isolate()->PrintWithTimestamp(
-          "[IncrementalMarking] Marking speed %.fKB/ms\n",
-          heap()->tracer()->IncrementalMarkingSpeedInBytesPerMillisecond());
-    }
-    // The first step after Scavenge will see many allocated bytes.
-    // Cap the step size to distribute the marking work more uniformly.
-    const double marking_speed =
-        heap()->tracer()->IncrementalMarkingSpeedInBytesPerMillisecond();
-    size_t max_step_size = GCIdleTimeHandler::EstimateMarkingStepSize(
-        max_step_size_in_ms, marking_speed);
-    bytes_to_process =
-        std::min(ComputeStepSizeInBytes(step_origin), max_step_size);
-    bytes_to_process = std::max({bytes_to_process, kMinStepSizeInBytes});
-
-    // Perform a single V8 and a single embedder step. In case both have been
-    // observed as empty back to back, we can finalize.
-    //
-    // This ignores that case where the embedder finds new V8-side objects. The
-    // assumption is that large graphs are well connected and can mostly be
-    // processed on their own. For small graphs, helping is not necessary.
-    std::tie(v8_bytes_processed, std::ignore) =
-        collector_->ProcessMarkingWorklist(bytes_to_process);
-    StepResult v8_result = local_marking_worklists()->IsEmpty()
-                               ? StepResult::kNoImmediateWork
-                               : StepResult::kMoreWorkRemaining;
-    StepResult embedder_result = StepResult::kNoImmediateWork;
-    if (heap_->local_embedder_heap_tracer()->InUse()) {
-      embedder_deadline =
-          std::min(max_step_size_in_ms,
-                   static_cast<double>(bytes_to_process) / marking_speed);
-      // TODO(chromium:1056170): Replace embedder_deadline with bytes_to_process
-      // after migrating blink to the cppgc library and after v8 can directly
-      // push objects to Oilpan.
-      embedder_result = EmbedderStep(embedder_deadline, &embedder_duration);
-    }
-    bytes_marked_ += v8_bytes_processed;
-    combined_result = CombineStepResults(v8_result, embedder_result);
-
-    if (combined_result == StepResult::kNoImmediateWork) {
-      if (!finalize_marking_completed_) {
-        FinalizeMarking(action);
-        FastForwardSchedule();
-        combined_result = StepResult::kWaitingForFinalization;
-        incremental_marking_job()->Start(heap_);
-      } else {
-        MarkingComplete(action);
-        combined_result = StepResult::kWaitingForFinalization;
-      }
-    }
-    if (FLAG_concurrent_marking) {
-      local_marking_worklists()->ShareWork();
-      heap_->concurrent_marking()->RescheduleJobIfNeeded();
-    }
-  }
-  if (state_ == MARKING) {
-    // Note that we do not report any marked by in case of finishing sweeping as
-    // we did not process the marking worklist.
-    const double v8_duration =
-        heap_->MonotonicallyIncreasingTimeInMs() - start - embedder_duration;
-    heap_->tracer()->AddIncrementalMarkingStep(v8_duration, v8_bytes_processed);
-  }
   if (FLAG_trace_incremental_marking) {
     heap_->isolate()->PrintWithTimestamp(
-        "[IncrementalMarking] Step %s V8: %zuKB (%zuKB), embedder: %fms (%fms) "
+        "[IncrementalMarking] Marking speed %.fKB/ms\n",
+        heap()->tracer()->IncrementalMarkingSpeedInBytesPerMillisecond());
+  }
+  // The first step after Scavenge will see many allocated bytes.
+  // Cap the step size to distribute the marking work more uniformly.
+  const double marking_speed =
+      heap()->tracer()->IncrementalMarkingSpeedInBytesPerMillisecond();
+  size_t max_step_size = GCIdleTimeHandler::EstimateMarkingStepSize(
+      max_step_size_in_ms, marking_speed);
+  bytes_to_process =
+      std::min(ComputeStepSizeInBytes(step_origin), max_step_size);
+  bytes_to_process = std::max({bytes_to_process, kMinStepSizeInBytes});
+
+  // Perform a single V8 and a single embedder step. In case both have been
+  // observed as empty back to back, we can finalize.
+  //
+  // This ignores that case where the embedder finds new V8-side objects. The
+  // assumption is that large graphs are well connected and can mostly be
+  // processed on their own. For small graphs, helping is not necessary.
+  std::tie(v8_bytes_processed, std::ignore) =
+      collector_->ProcessMarkingWorklist(bytes_to_process);
+  StepResult v8_result = local_marking_worklists()->IsEmpty()
+                             ? StepResult::kNoImmediateWork
+                             : StepResult::kMoreWorkRemaining;
+  StepResult embedder_result = StepResult::kNoImmediateWork;
+  if (heap_->local_embedder_heap_tracer()->InUse()) {
+    embedder_deadline =
+        std::min(max_step_size_in_ms,
+                 static_cast<double>(bytes_to_process) / marking_speed);
+    // TODO(chromium:1056170): Replace embedder_deadline with bytes_to_process
+    // after migrating blink to the cppgc library and after v8 can directly
+    // push objects to Oilpan.
+    embedder_result = EmbedderStep(embedder_deadline, &embedder_duration);
+  }
+  bytes_marked_ += v8_bytes_processed;
+
+  if (v8_result == StepResult::kNoImmediateWork &&
+      embedder_result == StepResult::kNoImmediateWork) {
+    // TODO(v8:12775): Try to remove.
+    FastForwardSchedule();
+  }
+
+  if (FLAG_concurrent_marking) {
+    local_marking_worklists()->ShareWork();
+    heap_->concurrent_marking()->RescheduleJobIfNeeded();
+  }
+
+  const double current_time = heap_->MonotonicallyIncreasingTimeInMs();
+  const double v8_duration = current_time - start - embedder_duration;
+  heap_->tracer()->AddIncrementalMarkingStep(v8_duration, v8_bytes_processed);
+
+  if (FLAG_trace_incremental_marking) {
+    heap_->isolate()->PrintWithTimestamp(
+        "[IncrementalMarking] Step %s V8: %zuKB (%zuKB), embedder: %fms "
+        "(%fms) "
         "in %.1f\n",
         step_origin == StepOrigin::kV8 ? "in v8" : "in task",
         v8_bytes_processed / KB, bytes_to_process / KB, embedder_duration,
-        embedder_deadline, heap_->MonotonicallyIncreasingTimeInMs() - start);
+        embedder_deadline, current_time - start);
   }
-  return combined_result;
 }
 
 }  // namespace internal
